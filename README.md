@@ -35,6 +35,13 @@ default route again. Configured DNS servers on other services are preserved.
 It also disables any enabled GlobalProtect localhost PAC on network services.
 Cleanup failures are reported with a nonzero exit status.
 
+After unloading the jobs, shutdown sends SIGTERM and allows up to 30 seconds
+for the GP processes to exit (PanGPS's installed launchd exit timeout is 20
+seconds). If they stay stuck, it rechecks each PID's executable and sends
+SIGKILL only to the remaining PanGPS or GlobalProtect executable, then waits
+another five seconds. A process-inspection error prevents forced termination
+and network cleanup. Helpers and the system extension are not targeted.
+
 `off` requires three consecutive clean network-state checks, then verifies
 DNS and HTTPS with a direct request to `https://www.apple.com/`, falling back
 to `https://example.com/`. It prints `Done` only after those checks pass.
@@ -74,7 +81,8 @@ bash tests/network-cleanup.sh
 ```
 
 These fixtures exercise IPv4/IPv6 route cleanup, DNS and PAC cleanup, repeated
-shutdown, gateway/interface changes, process and command failures, settings
+shutdown, gateway/interface changes, slow shutdown, forced shutdown, PID
+identity changes, process and command failures, settings
 reappearing after removal, and unavailable HTTPS. They do not substitute for
 a live `sudo ./gp-toggle.sh off` test on the affected network. macOS CI runs
 the same checks on every push and pull request.

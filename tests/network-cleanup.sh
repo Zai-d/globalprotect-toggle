@@ -84,9 +84,18 @@ cat > "$TEST_DIR/dscacheutil" <<'MOCK'
 #!/bin/bash
 exit 0
 MOCK
-chmod +x "$TEST_DIR/"{scutil,netstat,route,networksetup,curl,dscacheutil}
+cat > "$TEST_DIR/ps" <<'MOCK'
+#!/bin/bash
+if [[ "${MOCK_PID_REUSED:-0}" == 1 ]]; then
+  echo /usr/bin/unrelated
+else
+  echo /Applications/GlobalProtect.app/Contents/Resources/PanGPS
+fi
+MOCK
+chmod +x "$TEST_DIR/"{scutil,netstat,route,networksetup,curl,dscacheutil,ps}
 SCUTIL="$TEST_DIR/scutil" NETSTAT="$TEST_DIR/netstat" ROUTE="$TEST_DIR/route"
 NETWORKSETUP="$TEST_DIR/networksetup" CURL="$TEST_DIR/curl" DSCACHEUTIL="$TEST_DIR/dscacheutil"
+PS="$TEST_DIR/ps"
 
 reset_fixture() {
   unset MOCK_STATE_STUCK MOCK_SCUTIL_ERROR MOCK_NETSTAT_ERROR MOCK_DELETE_FAIL MOCK_ADD_FAIL
@@ -94,6 +103,9 @@ reset_fixture() {
   unset MOCK_PGREP_ERROR MOCK_PROCESS_STUCK MOCK_DISABLE_FAIL MOCK_REAPPEAR
   unset MOCK_WATCHER_MISSING
   unset MOCK_PHYSICAL_DISAPPEARS
+  unset MOCK_SLOW_EXIT MOCK_NEEDS_KILL MOCK_PID_REUSED
+  rm -f "$TEST_DIR/process-exited"
+  sleep_count=0
   for entity in DNS IPv4 IPv6 Proxies; do touch "$TEST_DIR/keys/$entity"; done
   # A nonempty sentinel keeps awk NR==FNR correct even before any deletions.
   echo sentinel > "$TEST_DIR/deleted"
@@ -190,17 +202,27 @@ echo 'PASS physical gateway and interface changes'
 
 # Full shutdown flow: replace every command that can affect the real host.
 need_root() { :; }
-stop_processes() {
-  echo stop >> "$TEST_DIR/events"
+kill() {
+  echo "signal $*" >> "$TEST_DIR/events"
   if [[ "${MOCK_PHYSICAL_DISAPPEARS:-0}" == 1 ]]; then
     awk '$1 != "default" || $4 != "en0"' "$TEST_DIR/inet" > "$TEST_DIR/inet.tmp"
     mv "$TEST_DIR/inet.tmp" "$TEST_DIR/inet"
   fi
+  if [[ "$1" == -KILL && "${MOCK_NEEDS_KILL:-0}" == 1 ]]; then
+    touch "$TEST_DIR/process-exited"
+  fi
+  return 0
 }
 killall() { :; }
 pgrep() {
   [[ "${MOCK_PGREP_ERROR:-0}" != 1 ]] || return 2
-  [[ "${MOCK_PROCESS_STUCK:-0}" == 1 ]] && return 0
+  if [[ "${MOCK_PROCESS_STUCK:-0}" == 1 ||
+        ( ( "${MOCK_SLOW_EXIT:-0}" == 1 || "${MOCK_NEEDS_KILL:-0}" == 1 ) &&
+          ! -f "$TEST_DIR/process-exited" ) ||
+        ( "${MOCK_PHYSICAL_DISAPPEARS:-0}" == 1 && "$sleep_count" == 0 ) ]]; then
+    echo 1234
+    return 0
+  fi
   return 1
 }
 launchctl() {
@@ -212,13 +234,17 @@ launchctl() {
   esac
 }
 sleep() {
+  ((sleep_count += 1))
+  if [[ "${MOCK_SLOW_EXIT:-0}" == 1 && "$sleep_count" -ge 12 ]]; then
+    touch "$TEST_DIR/process-exited"
+  fi
   # Model the extension republishing state after a successful removal.
   if [[ "${MOCK_REAPPEAR:-0}" == 1 ]]; then touch "$TEST_DIR/keys/DNS"; fi
 }
 install_route_watch() { echo refresh-watcher >> "$TEST_DIR/events"; }
 GUI_UID=502
 ROUTE_WATCH_PLIST="$TEST_DIR/watcher.plist"
-for scenario in success repeat gateway_restore http state proxy process inspect disable reappear reappear_without_watcher routes; do
+for scenario in success repeat gateway_restore slow_exit forced_exit reused_pid http state proxy process inspect disable reappear reappear_without_watcher routes; do
   reset_fixture
   case "$scenario" in
     http) export MOCK_HTTP_FAIL=1 ;;
@@ -231,9 +257,14 @@ for scenario in success repeat gateway_restore http state proxy process inspect 
     reappear_without_watcher) export MOCK_REAPPEAR=1 MOCK_WATCHER_MISSING=1 ;;
     routes) export MOCK_DELETE_FAIL=1 ;;
     gateway_restore) export MOCK_PHYSICAL_DISAPPEARS=1 ;;
+    slow_exit) export MOCK_SLOW_EXIT=1 ;;
+    forced_exit) export MOCK_NEEDS_KILL=1 ;;
+    reused_pid) export MOCK_NEEDS_KILL=1 MOCK_PID_REUSED=1 ;;
   esac
+  expect_success=0
+  case "$scenario" in success|repeat|gateway_restore|slow_exit|forced_exit) expect_success=1 ;; esac
   if gp_off > "$TEST_DIR/output" 2>&1; then
-    [[ "$scenario" == success || "$scenario" == repeat || "$scenario" == gateway_restore ]] || { cat "$TEST_DIR/output"; exit 1; }
+    [[ "$expect_success" == 1 ]] || { cat "$TEST_DIR/output"; exit 1; }
     grep -Eq 'DNS and HTTPS verified' "$TEST_DIR/output"
     grep -Eq '^Done\.' "$TEST_DIR/output"
     [[ $(head -n 2 "$TEST_DIR/events" | tail -n 1) == "bootout system/$ROUTE_WATCH_LABEL" ]]
@@ -243,13 +274,23 @@ for scenario in success repeat gateway_restore http state proxy process inspect 
     if [[ "$scenario" == gateway_restore ]]; then
       grep -Eqx -- '-n add default 192.168.160.1 -ifp en0' "$TEST_DIR/routes"
     fi
+    if [[ "$scenario" == slow_exit ]]; then
+      grep -Eqx -- 'signal -TERM 1234' "$TEST_DIR/events"
+      ! grep -Eq -- 'signal -KILL' "$TEST_DIR/events"
+    fi
+    if [[ "$scenario" == forced_exit ]]; then
+      grep -Eqx -- 'signal -KILL 1234' "$TEST_DIR/events"
+    fi
   else
-    [[ "$scenario" != success && "$scenario" != repeat && "$scenario" != gateway_restore ]] || { cat "$TEST_DIR/output"; exit 1; }
+    [[ "$expect_success" == 0 ]] || { cat "$TEST_DIR/output"; exit 1; }
     ! grep -Eq '^Done\.' "$TEST_DIR/output"
     ! grep -Eqx refresh-watcher "$TEST_DIR/events"
     if [[ "$scenario" == routes ]]; then
       # Failed route deletion must retain the ownership key for a safe retry.
       [[ -f "$TEST_DIR/keys/IPv4" ]]
+    fi
+    if [[ "$scenario" == reused_pid || "$scenario" == inspect ]]; then
+      ! grep -Eq -- 'signal -KILL' "$TEST_DIR/events"
     fi
   fi
   echo "PASS full shutdown: $scenario"

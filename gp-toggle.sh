@@ -20,6 +20,8 @@ NETSTAT=/usr/sbin/netstat
 ROUTE=/sbin/route
 CURL=/usr/bin/curl
 DSCACHEUTIL=/usr/bin/dscacheutil
+PS=/bin/ps
+GP_PROCESS_PATTERN='^/Applications/GlobalProtect.app/Contents/(Resources/PanGPS|MacOS/GlobalProtect)([[:space:]]|$)'
 ROUTE_WATCH_LABEL=com.globalprotect-toggle.route-watch
 ROUTE_WATCH_DIR=/usr/local/libexec/globalprotect-toggle
 ROUTE_WATCH_SCRIPT=$ROUTE_WATCH_DIR/gp-toggle.sh
@@ -86,13 +88,57 @@ start_globalprotect_app() {
   fi
 }
 
-stop_processes() {
-  local pattern="$1"
-  local pid
-
+signal_globalprotect_processes() {
+  local signal="$1" pid command pids result=0
+  pids=$(pgrep -f "$GP_PROCESS_PATTERN") || result=$?
+  [[ "$result" == 1 ]] && return 0
+  if (( result > 1 )); then
+    echo "Cannot inspect GlobalProtect processes (pgrep exit $result)." >&2
+    return 1
+  fi
   while read -r pid; do
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-  done < <(pgrep -f "$pattern" 2>/dev/null || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # Recheck each PID's executable immediately before signalling it. Do not
+    # match shells with GP paths in their arguments, helpers, or the extension.
+    command=$("$PS" -p "$pid" -o comm=) || continue
+    case "$command" in
+      /Applications/GlobalProtect.app/Contents/Resources/PanGPS|/Applications/GlobalProtect.app/Contents/MacOS/GlobalProtect)
+        kill "-$signal" "$pid" 2>/dev/null || true
+        ;;
+    esac
+  done <<<"$pids"
+}
+
+wait_for_globalprotect_exit() {
+  local timeout="$1" elapsed result
+  for (( elapsed=0; elapsed<timeout; elapsed++ )); do
+    result=0
+    pgrep -f "$GP_PROCESS_PATTERN" >/dev/null || result=$?
+    [[ "$result" == 1 ]] && return 0
+    (( result > 1 )) && return 2
+    sleep 1
+  done
+  globalprotect_processes_stopped
+}
+
+stop_globalprotect_processes() {
+  local result=0
+  signal_globalprotect_processes TERM || return 1
+  echo "  processes waiting up to 30 seconds for graceful shutdown"
+  wait_for_globalprotect_exit 30 || result=$?
+  [[ "$result" == 0 ]] && return 0
+  if [[ "$result" == 2 ]]; then
+    echo "Cannot inspect GlobalProtect processes; network cleanup postponed." >&2
+    return 1
+  fi
+  echo "  processes graceful shutdown timed out; stopping remaining GP executables"
+  signal_globalprotect_processes KILL || return 1
+  if ! wait_for_globalprotect_exit 5; then
+    echo "GlobalProtect processes persist after forced shutdown; network cleanup postponed." >&2
+    pgrep -fl "$GP_PROCESS_PATTERN" >&2 || true
+    return 1
+  fi
+  return 0
 }
 
 default_route() {
@@ -125,7 +171,7 @@ disable_job() {
 
 globalprotect_processes_stopped() {
   local result=0
-  pgrep -f '^/Applications/GlobalProtect.app/Contents/(Resources/PanGPS|MacOS/GlobalProtect)([[:space:]]|$)' >/dev/null || result=$?
+  pgrep -f "$GP_PROCESS_PATTERN" >/dev/null || result=$?
   # pgrep: 0 = found, 1 = absent, >1 = unable to inspect processes.
   [[ "$result" == 1 ]]
 }
@@ -459,18 +505,7 @@ gp_off() {
   disable_job "system/$DAEMON" || return 1
   echo "  daemon $DAEMON -> disabled"
 
-  sleep 1
-  stop_processes "/Applications/GlobalProtect.app/Contents/MacOS/GlobalProtect"
-  stop_processes "/Applications/GlobalProtect.app/Contents/Resources/PanGPS"
-  # Give SIGTERM time to finish before removing state that PanGPS can recreate.
-  for attempt in {1..5}; do
-    globalprotect_processes_stopped && break
-    sleep 1
-  done
-  if ! globalprotect_processes_stopped; then
-    echo "GlobalProtect processes are still running or cannot be inspected; retry off." >&2
-    return 1
-  fi
+  stop_globalprotect_processes || return 1
   # configd and the extension can settle asynchronously. Require three clean
   # observations instead of assuming one successful delete means recovery.
   for attempt in {1..10}; do
