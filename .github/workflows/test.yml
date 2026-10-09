@@ -16,3 +16,5 @@ jobs:
         run: /bin/bash -n gp-toggle.sh && /bin/bash -n gh-toggle.s && /bin/bash -n tests/network-cleanup.sh
       - name: Verify shutdown and network recovery fixtures
         run: /bin/bash tests/network-cleanup.sh
+      - name: Verify Copilot proxy routing and TLS transport
+        run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v

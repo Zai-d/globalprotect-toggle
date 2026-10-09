@@ -1,5 +1,60 @@
 # GlobalProtect Toggle
 
+## Copilot with the Dubai VPN connected
+
+Use the temporary Copilot launcher when you want GitHub/Copilot HTTPS traffic
+to use the direct physical connection while other destinations keep their
+normal routes through GlobalProtect:
+
+```bash
+python3 /Library/Personal/globalprotect-toggle/copilot-direct.py
+```
+
+Keep GlobalProtect connected to your Dubai gateway. The launcher starts a
+proxy on a random localhost port, binds GitHub/Copilot outbound connections
+to `en0`, and sets proxy variables only for this Copilot invocation and its
+child processes. It requires no sudo, changes no system routes or proxy
+settings, and stops the proxy when Copilot exits. HTTPS is passed through
+without decrypting it or disabling certificate checks. Other HTTPS
+destinations retain the default routing, including the VPN.
+
+Copilot itself uses your direct connection's public IP, which on the tested
+network is labeled Riyadh. Other traffic continues to use the Dubai VPN exit.
+This does not make Copilot see a Dubai IP; that requires access through a
+Dubai exit that allows Copilot. It also does not change an organization's
+gateway policy or Copilot account permissions.
+
+Check the split connection before starting Copilot:
+
+```bash
+python3 copilot-direct.py --check
+```
+
+The check calls two Copilot health endpoints through the direct interface and
+reports the location returned by IPinfo for another destination using normal
+routes. If you use Ethernet or another interface, specify
+`--interface en1` (or your active physical interface). Direct GitHub connections
+require IPv4 and never fall back to the VPN when interface binding fails.
+
+Pass ordinary Copilot arguments after `--`:
+
+```bash
+python3 copilot-direct.py -- --resume
+```
+
+The proxy supports HTTPS CONNECT. Plain HTTP requests from child processes
+using the inherited proxy variables are rejected; localhost destinations are
+excluded from proxying. Start Copilot normally when you don't want this setup.
+Changing networks may require restarting the launcher with the new interface.
+
+Run the proxy's routing and transport regression tests with:
+
+```bash
+python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+## Install the GlobalProtect toggle
+
 Install in the expected location:
 
 ```bash
