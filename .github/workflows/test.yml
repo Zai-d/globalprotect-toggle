@@ -1,0 +1,18 @@
+name: Network cleanup checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: /bin/bash -n gp-toggle.sh && /bin/bash -n gh-toggle.s && /bin/bash -n tests/network-cleanup.sh
+      - name: Verify shutdown and network recovery fixtures
+        run: /bin/bash tests/network-cleanup.sh
